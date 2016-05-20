@@ -10,7 +10,7 @@ using System.Threading.Tasks;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Threading;
-
+using Newtonsoft.Json;
 
 namespace Eruptic.Common.Utilities.Logging {
     /// <summary>
@@ -137,8 +137,23 @@ namespace Eruptic.Common.Utilities.Logging {
 #endif
         }
 
+        public static void Write(object parameterToConvertToJson, LogLevels level = LogLevels.Default) {
+#if LOG_FAST
+            WriteAsync(parameterToConvertToJson, level).ContinueWith(t => { });
+#else
+            var task = Task.Run(async () => {
+                await WriteAsync(parameterToConvertToJson, level).ConfigureAwait(false);
+            });
+            task.Wait();
+#endif
+        }
+
         public static Task WriteCriticalAsync(Exception ex) {
             return WriteAsync(ex, LogLevels.Critical);
+        }
+
+        public static Task WriteAsync(object parameterToConvertToJson, LogLevels level = LogLevels.Default) {
+            return WriteAsync($"object as JSON:{Environment.NewLine} {JsonConvert.SerializeObject(parameterToConvertToJson, Formatting.Indented)}", level);
         }
 
         public static Task WriteAsync(string messageFormat, params object[] args) {
