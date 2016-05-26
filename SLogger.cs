@@ -1,4 +1,8 @@
-﻿using System;
+﻿//#define LOCK_LOGCONSOLE 
+//#define NO_LOG
+//#define LOG_TO_FILE
+
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -12,12 +16,14 @@ using System.Runtime.CompilerServices;
 using System.Threading;
 using Newtonsoft.Json;
 
-namespace Eruptic.Common.Utilities.Logging {
+namespace Eruptic.Core.Common.Utilities.Logging {
+    /// <summary>
+    /// Ultra simple logger
+    /// </summary>
     /// <summary>
     /// Ultra simple logger
     /// </summary>
     public static class SLogger {
-
         public enum LogLevels {
             Default = 0,
             Trace = 1,
@@ -153,14 +159,16 @@ namespace Eruptic.Common.Utilities.Logging {
         }
 
         public static Task WriteAsync(object parameterToConvertToJson, LogLevels level = LogLevels.Default) {
-            return WriteAsync($"object as JSON:{Environment.NewLine} {JsonConvert.SerializeObject(parameterToConvertToJson, Formatting.Indented)}", level);
+            var objectToWrite = JsonConvert.SerializeObject(parameterToConvertToJson, Formatting.Indented);
+            return WriteAsync($"object as JSON:{Environment.NewLine} {objectToWrite}", level);
         }
 
         public static Task WriteAsync(string messageFormat, params object[] args) {
             return WriteAsync(messageFormat, LogLevels.Default, args);
         }
 
-#pragma warning disable CS1998 // This async method lacks 'await' operators and will run synchronously. Consider using the 'await' operator to await non-blocking API calls, or 'await Task.Run(...)' to do CPU-bound work on a background thread.
+        static readonly object lockFlag = new object();
+
         /// <summary>
         /// Main async writing version
         /// </summary>
@@ -168,31 +176,47 @@ namespace Eruptic.Common.Utilities.Logging {
         /// <param name="level"></param>
         /// <param name="args"></param>
         /// <returns></returns>
-        public static async Task WriteAsync(string messageFormat, LogLevels level, params object[] args) {
-#pragma warning restore CS1998 // This async method lacks 'await' operators and will run synchronously. Consider using the 'await' operator to await non-blocking API calls, or 'await Task.Run(...)' to do CPU-bound work on a background thread.
+        public static
+#if (!LOCK_LOGCONSOLE && LOG_TO_FILE) && !NO_LOG           
+            async
+#endif
+            Task WriteAsync(string messageFormat, LogLevels level, params object[] args) {
+            if (level < CurrentConsoleLogLevel && level < CurrentFileLogLevel)
+#if NO_LOG || LOCK_LOGCONSOLE || (!LOG_TO_FILE)
+                return Task.FromResult(0);
+#else
+                return;
+#endif
 
 #if !NO_LOG
 #if LOCK_LOGCONSOLE
-            lock (lockFlag)
-            {
+            lock (lockFlag) {
 #endif
             {
-                if (level < CurrentConsoleLogLevel && level < CurrentFileLogLevel) return;
                 string message = messageFormat;
 
                 if (args != null && args.Length > 0) {
                     try {
                         message = string.Format(messageFormat, args);
-                        message = string.Format("{0:ddMMyy:hh:mm:ss:ffff} : {1} ", DateTime.Now, message);
+                        message = $"{DateTime.Now:ddMMyy:hh:mm:ss:ffff} : {message} ";
                     } catch { }
                 }
 
                 WriteConsoleLine(message, level);
+#if LOG_TO_FILE
+#if LOCK_LOGCONSOLE
+                return Task.Run(async () => await LogToFile(message, level).ConfigureAwait(false));
+#else
                 await LogToFile(message, level).ConfigureAwait(false);
+#endif
+#endif
             }
 #if LOCK_LOGCONSOLE
             }
 #endif
+#endif
+#if NO_LOG || LOCK_LOGCONSOLE || (!LOG_TO_FILE)
+            return Task.FromResult(0);
 #endif
         }
 
@@ -294,23 +318,24 @@ namespace Eruptic.Common.Utilities.Logging {
             {
                 if (IsLoggingToFileEnabled)
                 {
-                    await asyncLock.WaitAsync();
+                    await asyncLock.WaitAsync().ConfigureAwait(true);
                     WriteConsoleLine("Writing to log file");
                     message = message ?? string.Empty;
                     int messageLength = message.Length;
                     message = (messageLength < SingleMessageWriteToFileLengthLimit ?
                         message : message.Substring(0, SingleMessageWriteToFileLengthLimit));
-                    string sessionLogFileName = String.Format("logid_{0}.log", SessionID);
+                    string sessionLogFileName = $"logid_{SessionID}.log";
 
-                    IFile logFile = await PclRootLoggingFolder.CreateFileAsync(sessionLogFileName, CreationCollisionOption.OpenIfExists);
-                    var logs = await logFile.ReadAllTextAsync();
+                    IFile logFile = await PclRootLoggingFolder.CreateFileAsync(
+                        sessionLogFileName, CreationCollisionOption.OpenIfExists).ConfigureAwait(true);
+                    var logs = await logFile.ReadAllTextAsync().ConfigureAwait(true);
 
-                    message = string.Format("{0:dd-MM-yy HH:mm:ss} {1}", DateTime.Now, message);
+                    message = $"{DateTime.Now:dd-MM-yy HH:mm:ss} {message}";
 
                     if (!string.IsNullOrWhiteSpace(logs) && logs.Length > LogRollLengthLimit)//TODO: improve performance with chunks
                     {
                         logs = logs.Substring(LogRollLengthLimit - message.Length);
-                        await logFile.WriteAllTextAsync(logs);
+                        await logFile.WriteAllTextAsync(logs).ConfigureAwait(true);
                     }
                     if (logToFileBuffer.Length < BufferLengthLimit && !isFlush)
                     {
@@ -318,7 +343,8 @@ namespace Eruptic.Common.Utilities.Logging {
                     }
                     else
                     {
-                        await AppendToFile(logFile, logToFileBuffer.Length > 0 ? logToFileBuffer : message);
+                        await AppendToFile(
+                            logFile, logToFileBuffer.Length > 0 ? logToFileBuffer : message).ConfigureAwait(true);
                         logToFileBuffer = string.Empty;
                     }
                 }
@@ -335,16 +361,17 @@ namespace Eruptic.Common.Utilities.Logging {
 
         public static void Flush()
         {
-            Task.Run(async () => await LogToFile(string.Empty, LogLevels.Critical, true));
+            Task.Run(async () => await LogToFile(string.Empty, LogLevels.Critical, true).ConfigureAwait(true));
         }
 
         private static async Task AppendToFile(IFile file, string message)
         {
-            using (StreamWriter writer = new StreamWriter(await file.OpenAsync(FileAccess.ReadAndWrite)))
+            using (StreamWriter writer = new StreamWriter(
+                await file.OpenAsync(FileAccess.ReadAndWrite).ConfigureAwait(true)))
             {
                 writer.BaseStream.Seek(0, SeekOrigin.End);
-                await writer.WriteLineAsync(message);
-                await writer.FlushAsync();
+                await writer.WriteLineAsync(message).ConfigureAwait(true);
+                await writer.FlushAsync().ConfigureAwait(true);
             }
         }
 #else
