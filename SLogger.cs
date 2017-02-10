@@ -1,6 +1,5 @@
-﻿//#define LOCK_LOGCONSOLE 
 //#define NO_LOG
-//#define LOG_TO_FILE
+#define LOG_TO_FILE
 
 using System;
 using System.Collections.Generic;
@@ -16,7 +15,7 @@ using System.Runtime.CompilerServices;
 using System.Threading;
 using Newtonsoft.Json;
 
-namespace Eruptic.Core.Common.Utilities.Logging {
+namespace Eruptic.Core.Common.Utilities {
     /// <summary>
     /// Ultra simple logger
     /// </summary>
@@ -25,39 +24,64 @@ namespace Eruptic.Core.Common.Utilities.Logging {
     /// </summary>
     public static class SLogger {
         public enum LogLevels {
+            Everything = int.MinValue,
+            Flood = -10000,
+            Private = -1, //TODO: allow write security sensitive data to log? must be some special compiler variable
             Default = 0,
             Trace = 1,
             Warning = 10,
             Exceptions = 100,
+            LogToFile = 101,
+            SaveLog = 110, //Save to database
             Critical = 1000,
-            None = int.MaxValue
+            None = int.MaxValue, //Log disabled            
         }
+        private static LogLevels currentConsoleLogLevel = //use field here for performance reasons
 #if DEBUG
-        private const LogLevels CurrentConsoleLogLevel = LogLevels.Default;
+        LogLevels.Default;
 #else
-        private const LogLevels CurrentConsoleLogLevel = LogLevels.Critical;
+        LogLevels.Critical;
 #endif
-        private const LogLevels CurrentFileLogLevel = LogLevels.Critical;
+        private static LogLevels currentFileLogLevel = LogLevels.Critical;//field for performance reasons
+
+        public static LogLevels CurrentFileLogLevel {
+            get { return currentFileLogLevel; }
+            set { currentFileLogLevel = value; }
+        }
+
+        public static LogLevels CurrentConsoleLogLevel {
+            get { return currentConsoleLogLevel; }
+            set { currentConsoleLogLevel = value; }
+        }
+
+        private const int writeWaitTimoutMilliseconds = 20;
 
         /// <summary>
-        /// Limit length of string to write to file. Long writes make the app unstable.
+        /// Limit length of string to write to file. Long writes make the app unstable on mobile.
         /// </summary>
-        private const int SingleMessageWriteToFileLengthLimit = 20 * 1024; //20 kb
+        private const int SingleMessageWriteToFileLengthLimit = 100 * 1024; //20 kb
 
         /// <summary>
         /// Rolling appender limit.
         /// </summary>
-        private const int LogRollLengthLimit = 10 * 1024 * 1024;
+        private const int BufferLengthLimit = 1 * SingleMessageWriteToFileLengthLimit;
+
+        private const int ChunkFileLengthLimit = 10 * BufferLengthLimit;
 
         /// <summary>
         /// Rolling appender limit.
         /// </summary>
-        private const int BufferLengthLimit = 0 * 1024;
+        private const int ChunkFileCountLimit = 1000;
+
+        /// <summary>
+        /// Rolling appender limit.
+        /// </summary>
+        private const int LogRollLengthLimit = ChunkFileCountLimit * ChunkFileLengthLimit;
 
         /// <summary>
         /// Limits the length of inner exception
         /// </summary>
-        private const int InnerExceptionDescriptionLenghtLimit = 150 * 1024;//150 kb
+        private const int InnerExceptionDescriptionLenghtLimit = SingleMessageWriteToFileLengthLimit;
 
         /// <summary>
         ///  Set with your app name, is used  in log visibility prefix. 
@@ -77,16 +101,14 @@ namespace Eruptic.Core.Common.Utilities.Logging {
             }
         }
 
-        private static readonly SemaphoreSlim asyncLock = new SemaphoreSlim(1);
-
         public static void WriteConsoleLine(string messageFormat, LogLevels level = LogLevels.Default) {
             string prefix = Environment.NewLine + LogVisibilityMarkerPrefix;
             try {
                 string messageFormatResult = prefix + messageFormat.Replace(Environment.NewLine, prefix);
 #if DEBUG
-                if (level < CurrentConsoleLogLevel) return;
+                if (level < currentConsoleLogLevel) return;
 
-                WriteEvent?.Invoke(null, new SLoggerWriteLogEventArgs(messageFormat));
+                WriteEvent?.Invoke(null, new LogEventArgs(messageFormat));
 
                 Debug.WriteLine(messageFormatResult);
 #else
@@ -100,6 +122,26 @@ namespace Eruptic.Core.Common.Utilities.Logging {
 
         public static void WriteCritical(Exception ex) {
             Write(ex, LogLevels.Critical);
+        }
+
+        public static Task WriteCriticalAsync(Exception ex) {
+            return WriteAsync(ex, LogLevels.Critical);
+        }
+
+        public static void WriteTrace(object objectToJson, LogLevels level = LogLevels.Trace,
+            [CallerMemberName] string callingMethod = "",
+            [CallerFilePath] string callingFilePath = "",
+            [CallerLineNumber] int callingFileLineNumber = 0) {
+            callingFilePath = (callingFilePath ?? "").Replace("\\", "/");
+            if (objectToJson != null) {
+                string jsonObject = $"object can not be serialized : {objectToJson}";
+                try {
+                    jsonObject = JsonConvert.SerializeObject(objectToJson, Formatting.Indented);
+                } catch (Exception ex) {
+                    WriteAsync(ex);
+                }
+                WriteTrace(jsonObject, level, callingMethod, callingFilePath, callingFileLineNumber);
+            }
         }
 
         public static void WriteTrace(string message = null, LogLevels level = LogLevels.Trace,
@@ -125,10 +167,9 @@ namespace Eruptic.Core.Common.Utilities.Logging {
 #if LOG_FAST
             WriteAsync(messageFormat, level, args).ContinueWith(t => { });
 #else
-            var task = Task.Run(async () => {
+            Task.Run(async () => {
                 await WriteAsync(messageFormat, level, args).ConfigureAwait(false);
-            });
-            task.Wait();
+            }).Wait(writeWaitTimoutMilliseconds);
 #endif
         }
 
@@ -136,10 +177,9 @@ namespace Eruptic.Core.Common.Utilities.Logging {
 #if LOG_FAST
             WriteAsync(ex, level).ContinueWith(t => { });
 #else
-            var task = Task.Run(async () => {
+            Task.Run(async () => {
                 await WriteAsync(ex, level).ConfigureAwait(false);
-            });
-            task.Wait();
+            }).Wait(writeWaitTimoutMilliseconds);
 #endif
         }
 
@@ -147,28 +187,51 @@ namespace Eruptic.Core.Common.Utilities.Logging {
 #if LOG_FAST
             WriteAsync(parameterToConvertToJson, level).ContinueWith(t => { });
 #else
-            var task = Task.Run(async () => {
+            Task.Run(async () => {
                 await WriteAsync(parameterToConvertToJson, level).ConfigureAwait(false);
-            });
-            task.Wait();
+            }).Wait(writeWaitTimoutMilliseconds);
 #endif
         }
 
-        public static Task WriteCriticalAsync(Exception ex) {
+        public static Task WriteAsync(Exception ex) {
             return WriteAsync(ex, LogLevels.Critical);
         }
 
+        /// <summary>
+        /// Synchronous version 
+        /// </summary>
+        /// <param name="messageFormat"></param>
+        /// <param name="args"></param>
+        public static void WriteFlood(string messageFormat, params object[] args) {
+#if LOG_FAST
+            WriteFloodAsync(messageFormat, args).ContinueWith(t => { });
+#else
+            Task.Run(async () => {
+                await WriteFloodAsync(messageFormat, args).ConfigureAwait(false);
+            }).Wait(writeWaitTimoutMilliseconds);
+#endif
+        }
+
+        public static Task WriteFloodAsync(string messageFormat, params object[] args) {
+            return WriteAsync(messageFormat, LogLevels.Flood, args);
+        }
+
         public static Task WriteAsync(object parameterToConvertToJson, LogLevels level = LogLevels.Default) {
-            var objectToWrite = JsonConvert.SerializeObject(parameterToConvertToJson, Formatting.Indented);
-            return WriteAsync($"object as JSON:{Environment.NewLine} {objectToWrite}", level);
+            try {
+                var objectToWrite = JsonConvert.SerializeObject(parameterToConvertToJson, Formatting.Indented);
+                return WriteAsync($"object as JSON:{Environment.NewLine} {objectToWrite}", level);
+            } catch (JsonSerializationException ex) {
+                return WriteAsync($"object :{Environment.NewLine} {parameterToConvertToJson}", level);
+            } catch (Exception ex) {
+                return WriteAsync(ex, level);
+            }
         }
 
         public static Task WriteAsync(string messageFormat, params object[] args) {
             return WriteAsync(messageFormat, LogLevels.Default, args);
         }
 
-        static readonly object lockFlag = new object();
-
+        private static SemaphoreSlim logWriteAsyncLock = new SemaphoreSlim(1);
         /// <summary>
         /// Main async writing version
         /// </summary>
@@ -177,46 +240,33 @@ namespace Eruptic.Core.Common.Utilities.Logging {
         /// <param name="args"></param>
         /// <returns></returns>
         public static
-#if (!LOCK_LOGCONSOLE && LOG_TO_FILE) && !NO_LOG           
+#if !NO_LOG            
             async
-#endif
+#endif            
             Task WriteAsync(string messageFormat, LogLevels level, params object[] args) {
-            if (level < CurrentConsoleLogLevel && level < CurrentFileLogLevel)
-#if NO_LOG || LOCK_LOGCONSOLE || (!LOG_TO_FILE)
-                return Task.FromResult(0);
-#else
-                return;
-#endif
-
-#if !NO_LOG
-#if LOCK_LOGCONSOLE
-            lock (lockFlag) {
-#endif
-            {
-                string message = messageFormat;
-
-                if (args != null && args.Length > 0) {
-                    try {
-                        message = string.Format(messageFormat, args);
-                        message = $"{DateTime.Now:ddMMyy:hh:mm:ss:ffff} : {message} ";
-                    } catch { }
-                }
-
-                WriteConsoleLine(message, level);
-#if LOG_TO_FILE
-#if LOCK_LOGCONSOLE
-                return Task.Run(async () => await LogToFile(message, level).ConfigureAwait(false));
-#else
-                await LogToFile(message, level).ConfigureAwait(false);
-#endif
-#endif
-            }
-#if LOCK_LOGCONSOLE
-            }
-#endif
-#endif
-#if NO_LOG || LOCK_LOGCONSOLE || (!LOG_TO_FILE)
+#if NO_LOG
             return Task.FromResult(0);
+#else
+            if (level < currentConsoleLogLevel && level < currentFileLogLevel)
+                return;
+            try {
+                await logWriteAsyncLock.WaitAsync().ConfigureAwait(false);
+
+                if (args?.Length > 0)
+                    try { messageFormat = string.Format(messageFormat, args); } catch { }
+#if UTC_TIME
+                messageFormat = $"{DateTime.UtcNow:ddMMyy HH:mm:ss:ffffU}> {messageFormat} ";
+#else
+                messageFormat = $"{DateTime.Now:ddMMyy HH:mm:ss:ffff} : {messageFormat} ";
+#endif
+
+                WriteConsoleLine(messageFormat, level);
+#if LOG_TO_FILE
+                await LogToFile($"{messageFormat}\n", level).ConfigureAwait(false);
+#endif
+            } finally {
+                logWriteAsyncLock.Release();
+            }
 #endif
         }
 
@@ -226,28 +276,40 @@ namespace Eruptic.Core.Common.Utilities.Logging {
         /// <param name="exception"></param>
         /// <param name="level"></param>
         /// <returns></returns>
-        public static Task WriteAsync(Exception exception, LogLevels level = LogLevels.Exceptions) {
-            Task t;
-            string exceptionText = string.Empty;
+        public static
 #if !NO_LOG
-            var sb = new StringBuilder();
-
-            sb.AppendFormat("{0}{0}************exception start***************{1}", Environment.NewLine, GetExceptionDescription(exception));
-            while (exception.InnerException != null && sb.Length < InnerExceptionDescriptionLenghtLimit) {
-                sb.Append(GetExceptionDescription(exception.InnerException));
-                exception = exception.InnerException;
-            }
-            sb.AppendFormat("************exception end***************{0}{0}", Environment.NewLine);
-            exceptionText = sb.ToString();
-            t = WriteAsync(exceptionText, level);
-#else
-            t = Task.FromResult(0);
+            async
 #endif
-            WriteExceptionEvent?.Invoke(null, new SLoggerWriteLogEventArgs($" : {level} : \n{exceptionText}"));
-            return t;
+            Task WriteAsync(Exception exception, LogLevels level = LogLevels.Exceptions) {
+            string exceptionText = string.Empty;
+            try {
+                exceptionText = GetExceptionDescription(exception);
+#if NO_LOG
+                return Task.FromResult(0);
+#else
+                await WriteAsync(exceptionText, level).ConfigureAwait(false);
+                await FlushAsync().ConfigureAwait(false);
+#endif
+            } finally {
+                WriteExceptionEvent?.Invoke(null, new LogEventArgs($" : {level} : \n{exceptionText}"));
+            }
         }
 
         public static string GetExceptionDescription(Exception exception) {
+            string result;
+            var sb = new StringBuilder();
+
+            sb.AppendFormat("{0}{0}************exception start***************{1}", Environment.NewLine, GetSimpleExceptionDescription(exception));
+            while (exception.InnerException != null && sb.Length < InnerExceptionDescriptionLenghtLimit) {
+                sb.Append(GetSimpleExceptionDescription(exception.InnerException));
+                exception = exception.InnerException;
+            }
+            sb.AppendFormat("************exception end***************{0}{0}", Environment.NewLine);
+            result = sb.ToString();
+            return result;
+        }
+
+        private static string GetSimpleExceptionDescription(Exception exception) {
             StringBuilder sb = new StringBuilder();
             const string stackEntrySeparator = "\t at ";
             //sb.AppendLine("**************************************************************************************");
@@ -270,14 +332,14 @@ namespace Eruptic.Core.Common.Utilities.Logging {
             return GetExceptionDescription(exception);
         }
 
-        public class SLoggerWriteLogEventArgs : EventArgs {
+        public class LogEventArgs : EventArgs {
             public string Message { get; private set; }
-            public SLoggerWriteLogEventArgs(string message) {
+            public LogEventArgs(string message) {
                 Message = message;
             }
         }
-        public static event EventHandler<SLoggerWriteLogEventArgs> WriteEvent;
-        public static event EventHandler<SLoggerWriteLogEventArgs> WriteExceptionEvent;
+        public static event EventHandler<LogEventArgs> WriteEvent;
+        public static event EventHandler<LogEventArgs> WriteExceptionEvent;
 
         #region Logging to file
 
@@ -289,18 +351,15 @@ namespace Eruptic.Core.Common.Utilities.Logging {
         }
 
 #if LOG_TO_FILE
-
+        private static readonly SemaphoreSlim logFileLock = new SemaphoreSlim(1);
         private static string rootLoggingFolder = "Logs";
 
         public static string RootLoggingFolder { get { return (PclRootLoggingFolder == null) ? null : PclRootLoggingFolder.Path; } }
 
         private static IFolder pclRootLoggingFolder;
-        private static IFolder PclRootLoggingFolder
-        {
-            get
-            {
-                if (pclRootLoggingFolder == null)
-                {
+        private static IFolder PclRootLoggingFolder {
+            get {
+                if (pclRootLoggingFolder == null) {
                     pclRootLoggingFolder = FileSystem.Current.LocalStorage.CreateFolderAsync(rootLoggingFolder, CreationCollisionOption.OpenIfExists).Result;
                     IsLoggingToFileEnabled &= true;
                 }
@@ -311,65 +370,68 @@ namespace Eruptic.Core.Common.Utilities.Logging {
 
         static string logToFileBuffer = string.Empty;
 
-        private static async Task LogToFile(string message, LogLevels level = CurrentFileLogLevel, bool isFlush = false)
-        {
-            if(level < CurrentFileLogLevel) return;
-            try
-            {
-                if (IsLoggingToFileEnabled)
-                {
-                    await asyncLock.WaitAsync().ConfigureAwait(true);
-                    WriteConsoleLine("Writing to log file");
+        private static IFile logFile;
+        private static int logFileCalculatedLength = 0;
+        private static int logCunkFileCounter = ChunkFileCountLimit;
+
+        private static async Task LogToFile(string message, LogLevels level = LogLevels.Default, bool isFlush = false) {
+            if (level >= currentFileLogLevel && isLoggingToFileEnabled)
+                try {
+                    await logFileLock.WaitAsync().ConfigureAwait(true);
                     message = message ?? string.Empty;
                     int messageLength = message.Length;
                     message = (messageLength < SingleMessageWriteToFileLengthLimit ?
                         message : message.Substring(0, SingleMessageWriteToFileLengthLimit));
-                    string sessionLogFileName = $"logid_{SessionID}.log";
 
-                    IFile logFile = await PclRootLoggingFolder.CreateFileAsync(
-                        sessionLogFileName, CreationCollisionOption.OpenIfExists).ConfigureAwait(true);
-                    var logs = await logFile.ReadAllTextAsync().ConfigureAwait(true);
+                    logToFileBuffer += message;
+                    if (logToFileBuffer.Length >= BufferLengthLimit || isFlush) {
+                        bool isChunkReset = logCunkFileCounter == ChunkFileCountLimit;
+                        if (isChunkReset) {
+                            Interlocked.Exchange(ref logCunkFileCounter, 0);
+                        }
 
-                    message = $"{DateTime.Now:dd-MM-yy HH:mm:ss} {message}";
+                        var isNewChunk = logFileCalculatedLength + logToFileBuffer.Length > ChunkFileLengthLimit;
+                        if (isNewChunk) {
+                            //var logs = await logFile.ReadAllTextAsync().ConfigureAwait(false);
+                            //logs = logs.Substring(LogRollLengthLimit - logToFileBuffer.Length);
+                            //await logFile.WriteAllTextAsync(logs).ConfigureAwait(true);
+                            Interlocked.Increment(ref logCunkFileCounter);
+                            logFile = null;
+                        }
 
-                    if (!string.IsNullOrWhiteSpace(logs) && logs.Length > LogRollLengthLimit)//TODO: improve performance with chunks
-                    {
-                        logs = logs.Substring(LogRollLengthLimit - message.Length);
-                        await logFile.WriteAllTextAsync(logs).ConfigureAwait(true);
-                    }
-                    if (logToFileBuffer.Length < BufferLengthLimit && !isFlush)
-                    {
-                        logToFileBuffer += message;
-                    }
-                    else
-                    {
-                        await AppendToFile(
-                            logFile, logToFileBuffer.Length > 0 ? logToFileBuffer : message).ConfigureAwait(true);
+                        var sessionLogFileName = $"logid_{SessionID}_{logCunkFileCounter}.log";
+                        logFile = logFile ?? await PclRootLoggingFolder.CreateFileAsync(
+                                sessionLogFileName, CreationCollisionOption.OpenIfExists).ConfigureAwait(true);
+
+                        if (isChunkReset || isNewChunk) {
+                            await logFile.WriteAllTextAsync(string.Empty).ConfigureAwait(true);
+                            Interlocked.Exchange(ref logFileCalculatedLength, 0);
+                        }
+
+                        await AppendToFile(logFile, logToFileBuffer).ConfigureAwait(true);
+                        Interlocked.Add(ref logFileCalculatedLength, logToFileBuffer.Length);
                         logToFileBuffer = string.Empty;
                     }
+                } catch (Exception ex) {
+                    WriteConsoleLine(GetExceptionDescription(ex));
+                } finally {
+                    logFileLock.Release();
                 }
-            }
-            catch (Exception ex)
-            {
-                WriteConsoleLine(GetExceptionDescription(ex));
-            }
-            finally
-            {
-                asyncLock.Release();
-            }
         }
 
-        public static void Flush()
-        {
-            Task.Run(async () => await LogToFile(string.Empty, LogLevels.Critical, true).ConfigureAwait(true));
+        public static void Flush() {
+            Task.Run(async () => await FlushAsync().ConfigureAwait(false)).Wait();
         }
 
-        private static async Task AppendToFile(IFile file, string message)
-        {
+        public static Task FlushAsync() {
+            return LogToFile(string.Empty, LogLevels.None, true);
+        }
+
+        private static async Task AppendToFile(IFile file, string message) {
             using (StreamWriter writer = new StreamWriter(
-                await file.OpenAsync(FileAccess.ReadAndWrite).ConfigureAwait(true)))
-            {
+                await file.OpenAsync(FileAccess.ReadAndWrite).ConfigureAwait(true))) {
                 writer.BaseStream.Seek(0, SeekOrigin.End);
+                WriteConsoleLine("Writing to log file");
                 await writer.WriteLineAsync(message).ConfigureAwait(true);
                 await writer.FlushAsync().ConfigureAwait(true);
             }
@@ -383,6 +445,11 @@ namespace Eruptic.Core.Common.Utilities.Logging {
 
         }
         public static string RootLoggingFolder { get { return ""; } }
+
+        public static LogLevels CurrentFileLogLevel {
+            get { return LogLevels.Default; }
+            set {  }
+        }
 #endif
 
         #endregion
